@@ -1,0 +1,324 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+###############################################################################
+# Configuración
+###############################################################################
+
+JENT_ROOT="${JENT_ROOT:-$HOME/jitterentropy-library}"
+TESTS_ROOT="${TESTS_ROOT:-$JENT_ROOT/tests}"
+RAW_ROOT="${RAW_ROOT:-$TESTS_ROOT/raw-entropy}"
+NIST_ROOT="${NIST_ROOT:-$TESTS_ROOT/SP800-90B_EntropyAssessment}"
+EA_NONIID="${EA_NONIID:-$NIST_ROOT/cpp/ea_non_iid}"
+
+CAMPAIGN_BASE="${CAMPAIGN_BASE:-$HOME/jitter-campaigns}"
+MAX_PARALLEL="${MAX_PARALLEL:-4}"
+USE_TASKSET="${USE_TASKSET:-0}"
+
+# Barrido real
+OSR_VALUES=(1 2 4 8)
+MAX_MEM_VALUES=(0 8 10 11)   # default, 128kB, 512kB, 1MB
+MEM_ACCESS_VALUES=(on off)
+
+CAMPAIGN_ID="correlation-real-$(date +%Y%m%d-%H%M%S)"
+CAMPAIGN_DIR="$CAMPAIGN_BASE/$CAMPAIGN_ID"
+WORKSPACES_DIR="$CAMPAIGN_DIR/workspaces"
+RESULTS_DIR="$CAMPAIGN_DIR/results"
+LOGS_DIR="$CAMPAIGN_DIR/logs"
+
+mkdir -p "$WORKSPACES_DIR" "$RESULTS_DIR" "$LOGS_DIR"
+
+###############################################################################
+# Comprobaciones
+###############################################################################
+
+require_path() {
+  local p="$1"
+  [[ -e "$p" ]] || { echo "ERROR: no existe $p" >&2; exit 1; }
+}
+
+require_exec() {
+  local p="$1"
+  [[ -x "$p" ]] || { echo "ERROR: no es ejecutable $p" >&2; exit 1; }
+}
+
+require_exec "$RAW_ROOT/recording_userspace/jitterentropy-hashtime"
+require_path "$RAW_ROOT/validation-restart/processdata.sh"
+require_path "$RAW_ROOT/validation-runtime/processdata.sh"
+require_path "$NIST_ROOT"
+require_exec "$EA_NONIID"
+require_exec "$NIST_ROOT/cpp/ea_restart"
+
+###############################################################################
+# Utilidades
+###############################################################################
+
+max_mem_label() {
+  local code="$1"
+  if [[ "$code" -eq 0 ]]; then
+    echo "default"
+  elif (( code >= 1 && code <= 10 )); then
+    echo "$((1 << (code - 1)))kB"
+  elif (( code >= 11 && code <= 20 )); then
+    echo "$((1 << (code - 11)))MB"
+  else
+    echo "unknown"
+  fi
+}
+
+wait_for_slot() {
+  while (( $(jobs -rp | wc -l) >= MAX_PARALLEL )); do
+    sleep 1
+  done
+}
+
+run_cmd() {
+  local core="$1"
+  shift
+  if [[ "$USE_TASKSET" -eq 1 ]] && command -v taskset >/dev/null 2>&1; then
+    taskset -c "$core" "$@"
+  else
+    "$@"
+  fi
+}
+
+build_flags() {
+  local osr="$1"
+  local max_mem="$2"
+  local mem_access="$3"
+  local all_caches="$4"
+
+  local flags=(--osr "$osr")
+
+  if [[ "$max_mem" -ne 0 ]]; then
+    flags+=(--max-mem "$max_mem")
+  fi
+
+  if [[ "$mem_access" == "off" ]]; then
+    flags+=(--disable-memory-access)
+  fi
+
+  if [[ "$all_caches" == "on" ]]; then
+    flags+=(--all-caches)
+  fi
+
+  printf '%s\n' "${flags[@]}"
+}
+
+parse_runtime_entropy() {
+  local f="$1"
+  awk -F': *' '/min\(H_original, 8 X H_bitstring\)/ {print $2}' "$f" | tail -n1
+}
+
+parse_restart_metric() {
+  local f="$1"
+  local key="$2"
+  awk -F': *' -v k="$key" '$1 == k {print $2}' "$f" | tail -n1
+}
+
+parse_restart_min() {
+  local f="$1"
+  awk -F': *' '/min\(H_r, H_c, H_I\)/ {print $2}' "$f" | tail -n1
+}
+
+copy_tree() {
+  local dst="$1"
+  mkdir -p "$dst"
+  cp -a "$RAW_ROOT/." "$dst/"
+}
+
+prepare_workspace() {
+  local ws="$1"
+  rm -rf "$ws/results-measurements" \
+         "$ws/results-analysis-runtime" \
+         "$ws/results-analysis-restart"
+
+  mkdir -p "$ws/results-measurements" \
+           "$ws/results-analysis-runtime" \
+           "$ws/results-analysis-restart"
+}
+
+prepare_nist_link() {
+  local job_root="$1"
+  ln -sfn "$NIST_ROOT" "$job_root/SP800-90B_EntropyAssessment"
+}
+
+run_one_combo() {
+  local id="$1"
+  local osr="$2"
+  local max_mem="$3"
+  local mem_access="$4"
+  local all_caches="$5"
+  local core="$6"
+
+  local job_root="$WORKSPACES_DIR/job_$id"
+  local ws="$job_root/raw-entropy"
+  local log="$LOGS_DIR/job_$id.log"
+  local row="$RESULTS_DIR/job_$id.row.csv"
+  local status="$RESULTS_DIR/job_$id.status.txt"
+
+  {
+    echo "START job=$id core=$core"
+    echo "params: osr=$osr max_mem=$max_mem mem_access=$mem_access all_caches=$all_caches"
+
+    copy_tree "$ws"
+    prepare_workspace "$ws"
+    prepare_nist_link "$job_root"
+
+    mapfile -t flags < <(build_flags "$osr" "$max_mem" "$mem_access" "$all_caches")
+    echo "flags: ${flags[*]}"
+
+    pushd "$ws/recording_userspace" >/dev/null
+
+    echo "[1/4] runtime generation"
+    run_cmd "$core" ./jitterentropy-hashtime \
+      1000000 1 ../results-measurements/jent-raw-noise \
+      "${flags[@]}"
+
+    echo "[2/4] restart generation"
+    run_cmd "$core" ./jitterentropy-hashtime \
+      1000 1000 ../results-measurements/jent-raw-noise-restart \
+      "${flags[@]}"
+
+    popd >/dev/null
+
+    pushd "$ws/validation-restart" >/dev/null
+    echo "[3/4] validation restart"
+    ENTROPYDATA_DIR="../results-measurements" \
+    RESULTS_DIR="../results-analysis-restart" \
+    bash ./processdata.sh
+    popd >/dev/null
+
+    pushd "$ws/validation-runtime" >/dev/null
+    echo "[4/4] validation runtime"
+    EA_TOOL="$EA_NONIID" \
+    EATOOL_NONIID="$EA_NONIID" \
+    bash ./processdata.sh ../results-measurements ../results-analysis-runtime
+    popd >/dev/null
+
+    local runtime_file
+    runtime_file="$(find "$ws/results-analysis-runtime" -maxdepth 1 -type f -name 'jent-raw-noise-*.minentropy_FF_8bits.txt' | sort | head -n1)"
+    local restart_file="$ws/results-analysis-restart/jent-raw-noise-restart-consolidated.minentropy_FF_8bits.txt"
+
+    [[ -n "$runtime_file" ]] || { echo "ERROR: no runtime analysis file"; exit 1; }
+    [[ -f "$restart_file" ]] || { echo "ERROR: no restart analysis file"; exit 1; }
+
+    local runtime_min
+    local h_r
+    local h_c
+    local h_i
+    local restart_min
+    local passed
+
+    runtime_min="$(parse_runtime_entropy "$runtime_file")"
+    h_r="$(parse_restart_metric "$restart_file" "H_r")"
+    h_c="$(parse_restart_metric "$restart_file" "H_c")"
+    h_i="$(parse_restart_metric "$restart_file" "H_I")"
+    restart_min="$(parse_restart_min "$restart_file")"
+
+    [[ -n "$runtime_min" ]] || { echo "ERROR: runtime_min vacío"; exit 1; }
+    [[ -n "$h_r" ]] || { echo "ERROR: H_r vacío"; exit 1; }
+    [[ -n "$h_c" ]] || { echo "ERROR: H_c vacío"; exit 1; }
+    [[ -n "$h_i" ]] || { echo "ERROR: H_I vacío"; exit 1; }
+    [[ -n "$restart_min" ]] || { echo "ERROR: restart_min vacío"; exit 1; }
+
+    if grep -q "Validation Test Passed" "$restart_file"; then
+      passed="yes"
+    else
+      passed="no"
+    fi
+
+    echo "$id,default,default,$osr,$max_mem,$(max_mem_label "$max_mem"),$mem_access,$all_caches,$runtime_min,$h_r,$h_c,$h_i,$restart_min,$passed,$ws" > "$row"
+    echo "OK" > "$status"
+    echo "END job=$id OK"
+  } >"$log" 2>&1 || {
+    echo "FAIL" > "$status"
+    return 1
+  }
+}
+
+###############################################################################
+# CSV inicial
+###############################################################################
+
+echo "job_id,hloop_level,hloop_real,osr,max_mem_code,max_mem_label,memory_access,all_caches,runtime_min_entropy,H_r,H_c,H_I,restart_min,restart_validation_passed,workspace" > "$RESULTS_DIR/all_results.csv"
+
+###############################################################################
+# Generación de combinaciones
+###############################################################################
+
+job_counter=0
+pids=()
+job_ids=()
+
+for osr in "${OSR_VALUES[@]}"; do
+  for max_mem in "${MAX_MEM_VALUES[@]}"; do
+    for mem_access in "${MEM_ACCESS_VALUES[@]}"; do
+      if [[ "$mem_access" == "on" ]]; then
+        all_cache_modes=(off on)
+      else
+        all_cache_modes=(off)
+      fi
+
+      for all_caches in "${all_cache_modes[@]}"; do
+        wait_for_slot
+
+        job_counter=$((job_counter + 1))
+        job_id=$(printf "%03d" "$job_counter")
+        core=$(( (job_counter - 1) % MAX_PARALLEL ))
+
+        run_one_combo "$job_id" "$osr" "$max_mem" "$mem_access" "$all_caches" "$core" &
+        pids+=("$!")
+        job_ids+=("$job_id")
+      done
+    done
+  done
+done
+
+fail_count=0
+
+for i in "${!pids[@]}"; do
+  pid="${pids[$i]}"
+  id="${job_ids[$i]}"
+  if ! wait "$pid"; then
+    echo "Job $id falló. Mira: $LOGS_DIR/job_$id.log" >&2
+    fail_count=$((fail_count + 1))
+  fi
+done
+
+###############################################################################
+# Consolidación
+###############################################################################
+
+for row in "$RESULTS_DIR"/job_*.row.csv; do
+  [[ -f "$row" ]] || continue
+  cat "$row" >> "$RESULTS_DIR/all_results.csv"
+done
+
+row_count=$(tail -n +2 "$RESULTS_DIR/all_results.csv" | wc -l)
+
+cat > "$RESULTS_DIR/campaign_summary.txt" <<EOF
+Campaign ID: $CAMPAIGN_ID
+Rows: $row_count
+Parallel jobs: $MAX_PARALLEL
+OSR values: ${OSR_VALUES[*]}
+MAX_MEM values: ${MAX_MEM_VALUES[*]}
+MEM_ACCESS values: ${MEM_ACCESS_VALUES[*]}
+EOF
+
+echo
+echo "CSV:  $RESULTS_DIR/all_results.csv"
+echo "Logs: $LOGS_DIR"
+echo "Summary: $RESULTS_DIR/campaign_summary.txt"
+
+if [[ "$row_count" -eq 0 ]]; then
+  echo "ERROR: no se generó ninguna fila válida." >&2
+  exit 1
+fi
+
+if [[ "$fail_count" -gt 0 ]]; then
+  echo "ERROR: hubo $fail_count jobs fallidos." >&2
+  exit 1
+fi
+
+echo "Campaña completada con $row_count filas."
